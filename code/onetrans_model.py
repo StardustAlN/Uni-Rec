@@ -25,19 +25,15 @@ class RotaryEmbedding(nn.Module):
         self.base = base
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._build_cache(max_seq_len)
-    
-    def _build_cache(self, seq_len: int) -> None:
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat([freqs, freqs], dim=-1)
-        self.register_buffer("cos_cached", emb.cos().unsqueeze(0), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().unsqueeze(0), persistent=False)
     
     def forward(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self.cos_cached[:, :seq_len, :].to(device)
-        sin = self.sin_cached[:, :seq_len, :].to(device)
-        return cos, sin
+        # Build RoPE embeddings dynamically for the given sequence length
+        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=device)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)  # [L, D]
+        cos_cached = emb.cos().unsqueeze(0).unsqueeze(0)  # [1, 1, L, D]
+        sin_cached = emb.sin().unsqueeze(0).unsqueeze(0)  # [1, 1, L, D]
+        return cos_cached, sin_cached
 
 
 def apply_rope_to_tensor(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -113,10 +109,20 @@ class MixedCausalAttention(nn.Module):
         k = k.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         
-        # RoPE
+        # RoPE - 动态生成
         cos, sin = self.rope(L, x.device)
-        q = apply_rope_to_tensor(q, cos, sin)
-        k = apply_rope_to_tensor(k, cos, sin)
+        # cos/sin shape: [1, 1, L, head_dim]
+        # q/k shape: [B, H, L, head_dim]
+        
+        def apply_rope(x, cos, sin):
+            # x: [B, H, L, D], cos/sin: [1, 1, L, D]
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            rotate_x = torch.cat([-x2, x1], dim=-1)
+            return x * cos + rotate_x * sin
+        
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
         
         # Causal attention mask
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=x.device), diagonal=1)
@@ -197,6 +203,15 @@ class OneTransTokenizer:
         device = batch['user_int_feats'].device
         B = batch['user_int_feats'].shape[0]
         
+        # 计算统一维度
+        user_int_dim = batch['user_int_feats'].shape[1]
+        user_dense_dim = batch['user_dense_feats'].shape[1]
+        item_int_dim = batch['item_int_feats'].shape[1]
+        item_dense_dim = batch.get('item_dense_feats', None)
+        item_dense_dim = item_dense_dim.shape[1] if item_dense_dim is not None else 0
+        
+        unified_dim = max(user_int_dim + user_dense_dim, item_int_dim + item_dense_dim)
+        
         token_list = []
         ns_mask_list = []
         
@@ -204,7 +219,10 @@ class OneTransTokenizer:
         user_int = batch['user_int_feats'].float()  # [B, user_int_dim]
         user_dense = batch['user_dense_feats'].float()  # [B, user_dense_dim]
         user_feat = torch.cat([user_int, user_dense], dim=-1)  # [B, user_int_dim + user_dense_dim]
-        token_list.append(user_feat.unsqueeze(1))  # [B, 1, D_user]
+        # Pad 到统一维度
+        if user_feat.shape[1] < unified_dim:
+            user_feat = F.pad(user_feat, (0, unified_dim - user_feat.shape[1]))
+        token_list.append(user_feat.unsqueeze(1))  # [B, 1, D]
         ns_mask_list.append(torch.zeros(B, 1, dtype=torch.bool, device=device))
         
         # 2. Item 特征 (NS tokens)
@@ -216,7 +234,10 @@ class OneTransTokenizer:
             item_feat = torch.cat([item_int, item_dense], dim=-1)
         else:
             item_feat = item_int
-        token_list.append(item_feat.unsqueeze(1))  # [B, 1, D_item]
+        # Pad 到统一维度
+        if item_feat.shape[1] < unified_dim:
+            item_feat = F.pad(item_feat, (0, unified_dim - item_feat.shape[1]))
+        token_list.append(item_feat.unsqueeze(1))  # [B, 1, D]
         ns_mask_list.append(torch.ones(B, 1, dtype=torch.bool, device=device))
         
         # 3. 序列特征 (混合，带时间戳)
@@ -235,8 +256,7 @@ class OneTransTokenizer:
                 # 简单的 ID embedding（实际应查表）
                 seq_emb = seq_data.float().unsqueeze(-1)  # [B, seq_len, 1]
                 # padding 到统一维度
-                pad_dim = max(self.user_int_dim + self.user_dense_dim, 
-                             self.item_int_dim) - 1
+                pad_dim = unified_dim - 1
                 seq_emb = F.pad(seq_emb, (0, pad_dim))  # [B, seq_len, D]
                 
                 seq_tokens.append(seq_emb)
@@ -260,18 +280,23 @@ class OneTransTokenizer:
 
 
 class OneTransModel(nn.Module):
-    """OneTrans 基础版模型"""
+    """OneTrans 基础版模型 - 轻量配置"""
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
-        d_model = config.get('d_model', 128)
-        n_heads = config.get('n_heads', 4)
-        d_ff = config.get('d_ff', 512)
-        n_layers = config.get('n_layers', 4)
-        max_seq_len = config.get('max_seq_len', 512)
+        d_model = config.get('d_model', 64)  # 减小默认维度
+        n_heads = config.get('n_heads', 2)   # 减少头数
+        d_ff = config.get('d_ff', 128)       # 减小 FFN
+        n_layers = config.get('n_layers', 2) # 减少层数
+        max_seq_len = config.get('max_seq_len', 128)
         
-        # 输入投影
-        self.input_proj = nn.Linear(max(56, 18), d_model, bias=False)
+        # 输入投影 - 根据实际维度动态调整
+        input_dim = max(
+            config.get('user_int_dim', 46) + config.get('user_dense_dim', 10),
+            config.get('item_int_dim', 14) + config.get('item_dense_dim', 4),
+            64  # 最小维度
+        )
+        self.input_proj = nn.Linear(input_dim, d_model, bias=False)
         
         # Transformer 栈
         self.layers = nn.ModuleList([

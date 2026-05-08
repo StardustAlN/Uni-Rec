@@ -110,7 +110,8 @@ def main(args):
         batch_size=args.batch_size,
         valid_ratio=0.0,  # 不使用验证集分割
         num_workers=args.num_workers,
-        shuffle_train=True
+        shuffle_train=True,
+        use_row_split=True  # 启用行级别分割以支持单 Row Group 数据
     )
     
     logger.info(f"Train/Val loaders created")
