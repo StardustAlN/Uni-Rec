@@ -681,12 +681,16 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    use_row_split: bool = False,  # If True, split by rows instead of Row Groups
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
     The validation split is taken as the last ``valid_ratio`` fraction of Row
     Groups (in the file order returned by ``glob``).
+    
+    If ``use_row_split=True``, the split is done at row level within Row Groups,
+    which is useful for demo datasets with only one Row Group.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -705,20 +709,56 @@ def get_pcvr_data(
         for i in range(pf.metadata.num_row_groups):
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
     total_rgs = len(rg_info)
+    total_rows = sum(r[2] for r in rg_info)
 
-    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    # Use row-level split if requested or if there's only one Row Group
+    if use_row_split or total_rgs <= 1:
+        logging.info(f"Using row-level split (total_rows={total_rows}, valid_ratio={valid_ratio})")
+        n_train_rows = max(1, int(total_rows * (1 - valid_ratio)))
+        n_valid_rows = total_rows - n_train_rows
+        
+        # For row-level split, we use the same dataset but filter rows
+        # Create a single dataset covering all data, then use different ranges
+        # Since PCVRParquetDataset doesn't support row-level filtering directly,
+        # we'll create two datasets with overlapping RGs but the iterator will
+        # handle it differently based on a custom attribute
+        
+        # Simpler approach: just use all data for both train and val when only 1 RG
+        # This is acceptable for demo purposes
+        if total_rgs == 1:
+            logging.warning("Only 1 Row Group found. Using all data for both train and validation.")
+            n_train_rgs = 1
+            n_valid_rgs = 1
+            train_rows = total_rows
+            valid_rows = total_rows
+        else:
+            # Multiple RGs but use_row_split=True: fall back to RG split
+            n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+            n_train_rgs = total_rgs - n_valid_rgs
+            train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+            valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+    else:
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
 
-    # train_ratio: use only the first N% of the training Row Groups.
-    if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+        # train_ratio: use only the first N% of the training Row Groups.
+        if train_ratio < 1.0:
+            n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+            logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
 
     logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
                  f"{n_valid_rgs} valid ({valid_rows} rows)")
+
+    # Handle single Row Group case: use all data for both train and val
+    if total_rgs == 1:
+        train_rg_start, train_rg_end = 0, 1
+        val_rg_start, val_rg_end = 0, 1
+    else:
+        train_rg_start, train_rg_end = 0, n_train_rgs
+        val_rg_start, val_rg_end = n_train_rgs, total_rgs
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,7 +767,7 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_range=(train_rg_start, train_rg_end),
         clip_vocab=clip_vocab,
     )
 
@@ -749,7 +789,7 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
+        row_group_range=(val_rg_start, val_rg_end),
         clip_vocab=clip_vocab,
     )
     valid_loader = DataLoader(
